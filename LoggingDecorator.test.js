@@ -1,5 +1,4 @@
-const { Logger, ConsoleHandler, FileHandler, TextFormatter, JsonFormatter } = require('./LoggingDecorator');
-const fs = require('fs');
+const { Logger, logDecorator } = require('./LoggingDecorator');
 
 let passed = 0;
 let failed = 0;
@@ -18,96 +17,95 @@ function section(title) {
   console.log(`\n── ${title} ${'─'.repeat(50 - title.length)}`);
 }
 
-section('Logger — log levels');
-{
-  const logs = [];
-  const handler = { handle: (e) => logs.push(e) };
-
-  const logger = new Logger('INFO');
-  logger._handlers = [handler];
-
-  logger.debug('debug msg');
-  logger.info('info msg');
-  logger.error('error msg');
-
-  assert(logs.length === 2, 'INFO level filters out DEBUG');
-  assert(logs[0].level === 'INFO', 'first log is INFO');
-  assert(logs[1].level === 'ERROR', 'second log is ERROR');
-}
-
-section('Logger — timestamp');
-{
-  const logs = [];
+function makeLogger(logs) {
   const logger = new Logger('DEBUG');
   logger._handlers = [{ handle: (e) => logs.push(e) }];
-  logger.info('test');
-
-  assert(typeof logs[0].timestamp === 'string', 'log entry has timestamp');
-  assert(!isNaN(Date.parse(logs[0].timestamp)), 'timestamp is valid ISO string');
+  return logger;
 }
 
-section('Logger — DEBUG level logs all');
-{
-  const logs = [];
-  const logger = new Logger('DEBUG');
-  logger._handlers = [{ handle: (e) => logs.push(e) }];
+(async () => {
+  section('logDecorator — sync function');
+  {
+    const logs = [];
+    const logger = makeLogger(logs);
 
-  logger.debug('d');
-  logger.info('i');
-  logger.error('e');
+    const add = logDecorator((a, b) => a + b, 'INFO', logger);
+    const result = await add(2, 3);
 
-  assert(logs.length === 3, 'DEBUG level logs all messages');
-}
+    assert(result === 5, 'returns correct result');
+    assert(logs.length === 2, 'logs call and return');
+    assert(logs[0].args[0] === 2 && logs[0].args[1] === 3, 'logs arguments');
+    assert(logs[1].result === 5, 'logs return value');
+    assert(typeof logs[1].duration === 'number', 'logs execution time');
+  }
 
-section('Logger — ERROR level logs only errors');
-{
-  const logs = [];
-  const logger = new Logger('ERROR');
-  logger._handlers = [{ handle: (e) => logs.push(e) }];
+  section('logDecorator — async function');
+  {
+    const logs = [];
+    const logger = makeLogger(logs);
 
-  logger.debug('d');
-  logger.info('i');
-  logger.error('e');
+    const fetchData = logDecorator(
+      async (id) => { await new Promise(r => setTimeout(r, 10)); return { id, data: 'ok' }; },
+      'INFO',
+      logger
+    );
 
-  assert(logs.length === 1, 'ERROR level logs only errors');
-  assert(logs[0].level === 'ERROR', 'logged entry is ERROR');
-}
+    const result = await fetchData(42);
+    assert(result.id === 42, 'async function returns correct result');
+    assert(logs[1].result.data === 'ok', 'logs async return value');
+    assert(logs[1].duration >= 10, 'execution time includes async delay');
+  }
 
-section('JsonFormatter');
-{
-  const formatter = new JsonFormatter();
-  const entry = { level: 'INFO', message: 'test', timestamp: '2026-01-01T00:00:00.000Z' };
-  const output = formatter.format(entry);
-  const parsed = JSON.parse(output);
-  assert(parsed.level === 'INFO', 'JSON output has level');
-  assert(parsed.message === 'test', 'JSON output has message');
-}
+  section('logDecorator — error logging');
+  {
+    const logs = [];
+    const logger = makeLogger(logs);
 
-section('TextFormatter');
-{
-  const formatter = new TextFormatter();
-  const entry = { level: 'INFO', message: 'hello', timestamp: '2026-01-01T00:00:00.000Z' };
-  const output = formatter.format(entry);
-  assert(output.includes('[INFO]'), 'text output includes level');
-  assert(output.includes('hello'), 'text output includes message');
-  assert(output.includes('2026-01-01'), 'text output includes timestamp');
-}
+    const failing = logDecorator(
+      () => { throw new Error('something went wrong'); },
+      'ERROR',
+      logger
+    );
 
-section('FileHandler');
-{
-  const path = '/tmp/test_log.json';
-  if (fs.existsSync(path)) fs.unlinkSync(path);
+    try {
+      await failing();
+    } catch (e) {
+      assert(e.message === 'something went wrong', 'error is rethrown');
+    }
 
-  const handler = new FileHandler(path);
-  handler.handle({ level: 'INFO', message: 'file test', timestamp: new Date().toISOString() });
+    const errorLog = logs.find(l => l.level === 'ERROR' && l.error);
+    assert(errorLog !== undefined, 'error is logged');
+    assert(errorLog.error === 'something went wrong', 'error message is logged');
+  }
 
-  const content = fs.readFileSync(path, 'utf8').trim();
-  const parsed = JSON.parse(content);
-  assert(parsed.message === 'file test', 'FileHandler writes to file');
+  section('logDecorator — conditional logging by level');
+  {
+    const logs = [];
+    const logger = makeLogger(logs);
+    logger.minLevel = 'ERROR';
 
-  fs.unlinkSync(path);
-}
+    const fn = logDecorator((x) => x * 2, 'INFO', logger);
+    await fn(5);
 
-console.log(`\n${'═'.repeat(55)}`);
-console.log(`  Results: ${passed} passed, ${failed} failed`);
-if (failed === 0) console.log('  All tests passed! 🎉');
+    assert(logs.length === 0, 'INFO logs suppressed when minLevel is ERROR');
+  }
+
+  section('logDecorator — execution time profiling');
+  {
+    const logs = [];
+    const logger = makeLogger(logs);
+
+    const slow = logDecorator(
+      async () => { await new Promise(r => setTimeout(r, 50)); return 'done'; },
+      'DEBUG',
+      logger
+    );
+
+    await slow();
+    assert(logs[1].duration >= 50, 'execution time is at least 50ms');
+  }
+
+  console.log(`\n${'═'.repeat(55)}`);
+  console.log(`  Results: ${passed} passed, ${failed} failed`);
+  if (failed === 0) console.log('  All tests passed! 🎉');
+})();
